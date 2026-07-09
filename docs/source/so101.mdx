@@ -444,6 +444,89 @@ leader.disconnect()
 </hfoption>
 </hfoptions>
 
+## Gripper Force Feedback
+
+The SO-101 leader arm supports optional **gripper force feedback** — when the follower grasps an object, the leader gripper resists squeezing past the follower's achieved grasp position (virtual wall effect). This provides haptic information about the grasp state during teleoperation.
+
+### Enabling Force Feedback
+
+Force feedback is configured via the leader teleop config. Here's how to enable it:
+
+<hfoptions id="enable_force_feedback">
+<hfoption id="Command">
+
+```bash
+lerobot-teleoperate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/tty.usbmodem58760431551 \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/tty.usbmodem58760431551 \
+    --teleop.gripper_force_feedback=true
+```
+
+</hfoption>
+<hfoption id="API example">
+
+<!-- prettier-ignore-start -->
+```python
+from lerobot.teleoperators.so_leader import SO101LeaderConfig, SO101Leader
+from lerobot.robots.so_follower import SO101FollowerConfig, SO101Follower
+from lerobot.teleoperators.so_leader import pair_leader_with_follower
+
+# Leader config with force feedback enabled
+leader_config = SO101LeaderConfig(
+    port="/dev/tty.usbmodem58760431551",
+    id="my_leader_arm",
+    gripper_force_feedback=True,
+    gripper_force_feedback_gain=1.0,  # 0.0 = no resistance, 1.0 = full
+)
+
+follower_config = SO101FollowerConfig(
+    port="/dev/tty.usbmodem58760431552",
+    id="my_follower_arm",
+)
+
+leader = SO101Leader(leader_config)
+follower = SO101Follower(follower_config)
+
+# Pair leader with follower to enable force feedback
+pair_leader_with_follower(leader, follower)
+
+leader.connect()
+follower.connect()
+```
+<!-- prettier-ignore-end -->
+
+</hfoption>
+</hfoptions>
+
+### Configuration Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `gripper_force_feedback` | `bool` | `False` | Enable/disable force feedback |
+| `gripper_force_feedback_gain` | `float` | `1.0` | Gain multiplier (0.0 = no resistance, 1.0 = full torque limit) |
+| `gripper_force_feedback_position_margin` | `float` | `3.0` | Position margin (gripper units 0–100) within which no resistance is applied |
+| `gripper_force_feedback_load_deadband` | `int` | `50` | Follower load deadband — values below this mean "nothing grasped" |
+| `gripper_force_feedback_max_overshoot` | `float` | `30.0` | Max overshoot beyond follower position for full torque limit |
+| `gripper_force_feedback_release_hysteresis` | `float` | `2.0` | Hysteresis for release detection to prevent chattering |
+| `gripper_force_feedback_torque_limit_min` | `int` | `0` | Minimum torque limit (Feetech units, 0–1024) |
+| `gripper_force_feedback_torque_limit_max` | `int` | `1024` | Maximum torque limit (Feetech units, 0–1024) |
+
+### How It Works
+
+1. The follower's gripper load (`Present_Load`) is monitored — when it exceeds the deadband, an object is assumed to be grasped
+2. When the leader gripper tries to close past the follower's current position (overshoot), a "virtual wall" is created
+3. The torque limit on the leader gripper increases proportionally to the overshoot amount
+4. When the leader moves back toward the follower (releasing), feedback is immediately disabled
+5. Torque bus writes only happen on state transitions (active/inactive, torque limit changes) to minimize serial bus traffic
+
+> [!TIP]
+> Force feedback works best when the leader and follower gripper calibrations are aligned. If the resistance feels incorrect, check that both arms report similar gripper positions when placed side by side.
+
+> [!NOTE]
+> The `pair_leader_with_follower()` helper is required — force feedback reads the follower's gripper state during the teleoperation loop. Without pairing, the feature silently no-ops.
+
 Congrats 🎉, your robot is all set to learn a task on its own. Start training it by following this tutorial: [Getting started with real-world robots](./il_robots)
 
 > [!TIP]
