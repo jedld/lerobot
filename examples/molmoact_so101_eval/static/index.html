@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MolmoAct2 SO-ARM101 Evaluation</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #101319;
+        color: #edf2f7;
+      }
+      body {
+        margin: 0;
+      }
+      main {
+        display: grid;
+        grid-template-columns: minmax(360px, 460px) 1fr;
+        gap: 20px;
+        padding: 20px;
+      }
+      section {
+        background: #171b23;
+        border: 1px solid #2b3342;
+        border-radius: 16px;
+        padding: 16px;
+        box-shadow: 0 10px 30px rgb(0 0 0 / 0.2);
+      }
+      h1,
+      h2 {
+        margin: 0 0 12px;
+      }
+      h1 {
+        font-size: 22px;
+      }
+      h2 {
+        font-size: 16px;
+        color: #b7c1d1;
+      }
+      label {
+        display: grid;
+        gap: 6px;
+        margin: 10px 0;
+        color: #c7d0dd;
+        font-size: 13px;
+      }
+      input,
+      textarea,
+      select,
+      button {
+        border-radius: 10px;
+        border: 1px solid #3a4456;
+        background: #0f1218;
+        color: #edf2f7;
+        padding: 10px 12px;
+        font: inherit;
+      }
+      textarea {
+        min-height: 74px;
+        resize: vertical;
+      }
+      button {
+        cursor: pointer;
+        background: #263248;
+        border-color: #475674;
+      }
+      button.primary {
+        background: #2d5bff;
+        border-color: #6284ff;
+      }
+      button.danger {
+        background: #8b1e2d;
+        border-color: #bc4052;
+      }
+      button.warning {
+        background: #735c16;
+        border-color: #b58a21;
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 12px;
+      }
+      .status-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .pill {
+        border: 1px solid #344057;
+        border-radius: 12px;
+        padding: 10px;
+        background: #111722;
+      }
+      .pill strong {
+        display: block;
+        margin-bottom: 4px;
+        color: #9fb1cb;
+        font-size: 12px;
+      }
+      .ok {
+        color: #7ee787;
+      }
+      .bad {
+        color: #ff8a8a;
+      }
+      .warn {
+        color: #ffd166;
+      }
+      #top_preview,
+      #side_preview {
+        width: 100%;
+        max-height: 60vh;
+        object-fit: contain;
+        border-radius: 16px;
+        border: 1px solid #2b3342;
+        background: #07090d;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow: auto;
+        max-height: 260px;
+        background: #0c1017;
+        border: 1px solid #252d3b;
+        border-radius: 12px;
+        padding: 12px;
+      }
+      .note {
+        color: #aeb9ca;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+        overflow: hidden;
+        border-radius: 12px;
+      }
+      th,
+      td {
+        padding: 8px 10px;
+        border-bottom: 1px solid #252d3b;
+        text-align: right;
+      }
+      th:first-child,
+      td:first-child {
+        text-align: left;
+      }
+      th {
+        color: #9fb1cb;
+        background: #111722;
+        font-size: 12px;
+      }
+      @media (max-width: 940px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>MolmoAct2 SO-ARM101 Evaluation</h1>
+        <p class="note">
+          This UI can send two local webcams as <code>top_cam</code> and <code>side_cam</code>
+          to the deployed SO100/SO101 MolmoAct2 endpoint. If only Top is connected, it is
+          duplicated into both inputs.
+        </p>
+
+        <h2>Inference</h2>
+        <label>
+          Endpoint
+          <input id="endpoint" value="http://192.168.0.233:8014/act" />
+        </label>
+        <label>
+          Instruction
+          <textarea id="instruction">pick up the object</textarea>
+        </label>
+        <div class="row">
+          <label>
+            Action FPS
+            <input id="action_fps" type="number" min="1" max="60" step="1" value="30" />
+          </label>
+          <label>
+            Max Step Deg
+            <input id="max_step_deg" type="number" min="1" step="1" value="15" />
+          </label>
+        </div>
+        <div class="row">
+          <label>
+            Robot Safety Clamp
+            <input id="max_relative_target" type="number" min="0" step="1" value="10" />
+          </label>
+          <label>
+            Actions Per Chunk
+            <input id="actions_per_chunk" type="number" min="1" max="30" step="1" placeholder="all" />
+          </label>
+        </div>
+        <div class="row">
+          <label>
+            Smoothing Alpha
+            <input id="smoothing_alpha" type="number" min="0.05" max="1" step="0.05" value="0.8" />
+          </label>
+          <label>
+            Interpolation Steps
+            <input id="interpolation_steps" type="number" min="1" max="12" step="1" value="3" />
+          </label>
+        </div>
+        <label>
+          <span>
+            <input id="apply_joint_conversion" type="checkbox" checked />
+            Apply SO-101 v3 to v2.1 joint conversion for MolmoAct2
+          </span>
+        </label>
+
+        <h2>Webcams</h2>
+        <label>
+          Top Camera
+          <select id="top_camera_select" onchange="selectCameraProfile('top')"></select>
+        </label>
+        <div class="row">
+          <label>
+            Top Camera Index
+            <input id="top_camera_index" type="number" min="0" step="1" value="0" />
+          </label>
+          <label>
+            Side Camera
+            <select id="side_camera_select" onchange="selectCameraProfile('side')"></select>
+          </label>
+        </div>
+        <div class="row">
+          <label>
+            Side Camera Index
+            <input id="side_camera_index" type="number" min="0" step="1" value="1" />
+          </label>
+          <label>
+            Camera FPS
+            <input id="camera_fps" type="number" min="1" max="60" step="1" value="30" />
+          </label>
+        </div>
+        <div class="row">
+          <label>
+            Width
+            <input id="camera_width" type="number" min="64" step="16" value="640" />
+          </label>
+          <label>
+            Height
+            <input id="camera_height" type="number" min="64" step="16" value="480" />
+          </label>
+        </div>
+
+        <h2>Robot</h2>
+        <label>
+          Serial Port
+          <select id="serial_port"></select>
+        </label>
+        <label>
+          Robot Calibration ID
+          <input id="robot_id" value="jedld-follower" />
+        </label>
+        <label>
+          <span><input id="calibrate" type="checkbox" /> Run calibration if needed</span>
+        </label>
+        <label>
+          <span><input id="auto_connect" type="checkbox" /> Auto-connect saved cameras and robot on page load</span>
+        </label>
+
+        <div class="buttons">
+          <button onclick="refreshDevices()">Refresh Ports</button>
+          <button onclick="autoDetectRobotPort()">Auto Detect Robot Port</button>
+          <button onclick="checkEndpoint()">Check Endpoint</button>
+          <button onclick="connectCamera('top')">Connect Top Webcam</button>
+          <button onclick="connectCamera('side')">Connect Side Webcam</button>
+          <button onclick="connectRobot()">Connect Robot</button>
+          <button class="warning" onclick="enterProgramMode()">Program Mode</button>
+          <button onclick="exitProgramMode()">Exit Program</button>
+          <button onclick="dryRun()">Dry Run</button>
+          <button class="primary" onclick="startEval()">Start Evaluation</button>
+          <button class="danger" onclick="stopEval()">Stop</button>
+          <button class="warning" onclick="resetHome()">Reset Home</button>
+          <button class="warning" onclick="resetPacked()">Pack Robot</button>
+          <button onclick="disconnectAll()">Disconnect</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Status</h2>
+        <div class="status-grid">
+          <div class="pill"><strong>Endpoint</strong><span id="endpoint_status">unknown</span></div>
+          <div class="pill"><strong>Top Webcam</strong><span id="top_camera_status">unknown</span></div>
+          <div class="pill"><strong>Side Webcam</strong><span id="side_camera_status">unknown</span></div>
+          <div class="pill"><strong>Robot</strong><span id="robot_status">unknown</span></div>
+          <div class="pill"><strong>Running</strong><span id="running_status">no</span></div>
+          <div class="pill"><strong>Program Mode</strong><span id="program_status">no</span></div>
+          <div class="pill"><strong>Joint Conversion</strong><span id="conversion_status">on</span></div>
+          <div class="pill"><strong>Obs Sync</strong><span id="sync_status">n/a</span></div>
+          <div class="pill"><strong>Inference</strong><span id="inference_status">n/a</span></div>
+          <div class="pill"><strong>Last Action</strong><span id="action_status">n/a</span></div>
+        </div>
+
+        <h2 style="margin-top: 16px">Joint Positions</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Joint</th>
+              <th>Position</th>
+            </tr>
+          </thead>
+          <tbody id="joint_positions">
+            <tr><td colspan="2">Connect robot to read joints</td></tr>
+          </tbody>
+        </table>
+
+        <h2 style="margin-top: 16px">Camera Preview</h2>
+        <div class="row">
+          <div>
+            <p class="note">Top Camera</p>
+            <img id="top_preview" alt="Connect top webcam to preview frames" />
+          </div>
+          <div>
+            <p class="note">Side Camera</p>
+            <img id="side_preview" alt="Connect side webcam to preview frames" />
+          </div>
+        </div>
+
+        <h2 style="margin-top: 16px">Log</h2>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const SETTINGS_KEY = "molmoact_so101_eval_settings";
+
+      async function api(path, body) {
+        const response = await fetch(path, {
+          method: body ? "POST" : "GET",
+          headers: body ? { "Content-Type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const payload = await response.json();
+        if (!response.ok || payload.error) {
+          throw new Error(payload.error || response.statusText);
+        }
+        return payload;
+      }
+
+      function formValues() {
+        return {
+          endpoint: $("endpoint").value,
+          instruction: $("instruction").value,
+          action_fps: Number($("action_fps").value),
+          top_camera_index: $("top_camera_index").value,
+          side_camera_index: $("side_camera_index").value,
+          width: Number($("camera_width").value),
+          height: Number($("camera_height").value),
+          fps: Number($("camera_fps").value),
+          serial_port: $("serial_port").value,
+          port: $("serial_port").value,
+          robot_id: $("robot_id").value,
+          max_relative_target: $("max_relative_target").value,
+          max_step_deg: Number($("max_step_deg").value),
+          actions_per_chunk: $("actions_per_chunk").value,
+          smoothing_alpha: Number($("smoothing_alpha").value),
+          interpolation_steps: Number($("interpolation_steps").value),
+          apply_joint_conversion: $("apply_joint_conversion").checked,
+          calibrate: $("calibrate").checked,
+          auto_connect: $("auto_connect").checked,
+        };
+      }
+
+      function saveSettings() {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(formValues()));
+      }
+
+      function loadSettings() {
+        const raw = localStorage.getItem(SETTINGS_KEY);
+        if (!raw) return {};
+        const settings = JSON.parse(raw);
+        for (const [id, value] of Object.entries(settings)) {
+          const element = $(id);
+          if (!element) continue;
+          if (id === "auto_connect") continue;
+          if (element.type === "checkbox") {
+            element.checked = Boolean(value);
+          } else {
+            element.value = value;
+          }
+        }
+        return settings;
+      }
+
+      function installSettingsPersistence() {
+        for (const element of document.querySelectorAll("input, textarea, select")) {
+          element.addEventListener("change", saveSettings);
+          element.addEventListener("input", saveSettings);
+        }
+      }
+
+      async function refreshDevices() {
+        const savedSettings = loadSettings();
+        const devices = await api("/api/devices");
+        const select = $("serial_port");
+        const previous = select.value || savedSettings.serial_port || savedSettings.port;
+        select.innerHTML = "";
+        for (const port of devices.serial_ports) {
+          const option = document.createElement("option");
+          option.value = port;
+          option.textContent = port;
+          select.appendChild(option);
+        }
+        if (previous) {
+          select.value = previous;
+        } else if (devices.detected_robot_port) {
+          select.value = devices.detected_robot_port;
+        }
+
+        populateCameraSelect("top", devices.opencv_cameras || [], savedSettings.top_camera_index);
+        populateCameraSelect("side", devices.opencv_cameras || [], savedSettings.side_camera_index);
+        await refreshStatus();
+      }
+
+      function populateCameraSelect(slot, cameras, savedCameraIndex) {
+        const cameraSelect = $(`${slot}_camera_select`);
+        const previousCamera = cameraSelect.value || savedCameraIndex || $(`${slot}_camera_index`).value;
+        cameraSelect.innerHTML = "";
+        for (const camera of cameras) {
+          const option = document.createElement("option");
+          option.value = String(camera.id);
+          option.dataset.fps = String(Math.round(camera.fps || 30));
+          const readable =
+            camera.readable === false ? " - opens, no frames" : camera.readable == null ? " - probe on connect" : "";
+          option.textContent = `${camera.name} (${camera.width}x${camera.height}@${Math.round(camera.fps || 0)} ${camera.backend_api})${readable}`;
+          cameraSelect.appendChild(option);
+        }
+        if (previousCamera) {
+          cameraSelect.value = previousCamera;
+        } else {
+          const preferred = slot === "top" ? "0" : "1";
+          if ([...cameraSelect.options].some((option) => option.value === preferred)) {
+            cameraSelect.value = preferred;
+          }
+        }
+        selectCameraProfile(slot);
+      }
+
+      function selectCameraProfile(slot) {
+        const option = $(`${slot}_camera_select`).selectedOptions[0];
+        if (!option) return;
+        $(`${slot}_camera_index`).value = option.value;
+        if (option.dataset.fps && Number(option.dataset.fps) > 0) $("camera_fps").value = option.dataset.fps;
+        saveSettings();
+      }
+
+      async function checkEndpoint() {
+        await api("/api/endpoint", { endpoint: $("endpoint").value });
+        await refreshStatus();
+      }
+
+      async function autoDetectRobotPort() {
+        const result = await api("/api/detect_robot_port", {});
+        await refreshDevices();
+        $("serial_port").value = result.port;
+        saveSettings();
+        await refreshStatus();
+      }
+
+      async function connectCamera(slot) {
+        saveSettings();
+        const values = formValues();
+        values.slot = slot;
+        values.camera_index = Number($(`${slot}_camera_index`).value);
+        const status = await api("/api/connect_camera", values);
+        syncConnectedCameraSelection(slot, slot === "top" ? status.top_camera : status.side_camera);
+        await renderStatus(status);
+      }
+
+      async function connectRobot() {
+        saveSettings();
+        const values = formValues();
+        await api("/api/connect_robot", values);
+        await refreshStatus();
+      }
+
+      async function autoConnectSaved() {
+        if (!$("auto_connect").checked) return;
+        const status = await api("/api/status");
+        const values = formValues();
+        try {
+          if (!status.top_camera_connected && values.top_camera_index !== "") {
+            await connectCamera("top");
+          }
+          const latest = await api("/api/status");
+          if (!latest.side_camera_connected && values.side_camera_index !== "" && values.side_camera_index !== values.top_camera_index) {
+            await connectCamera("side");
+          }
+          const afterCameras = await api("/api/status");
+          if (!afterCameras.robot_connected && values.port) {
+            await api("/api/connect_robot", { ...values, calibrate: false });
+            await refreshStatus();
+          }
+        } catch (error) {
+          $("log").textContent += `\nAuto-connect skipped: ${error.message}`;
+        }
+      }
+
+      async function enterProgramMode() {
+        if (!confirm("Disable motor torque so you can move the joints by hand? Hold the arm before continuing.")) return;
+        await api("/api/program_mode", {});
+        await refreshStatus();
+      }
+
+      async function exitProgramMode() {
+        await api("/api/exit_program_mode", {});
+        await refreshStatus();
+      }
+
+      async function dryRun() {
+        await api("/api/dry_run", formValues());
+        await refreshStatus();
+      }
+
+      async function startEval() {
+        await api("/api/start", formValues());
+        await refreshStatus();
+      }
+
+      async function stopEval() {
+        await api("/api/stop", {});
+        await refreshStatus();
+      }
+
+      async function resetHome() {
+        if (!confirm("Stop evaluation and move the robot to the home position?")) return;
+        await api("/api/reset_home", {});
+        await refreshStatus();
+      }
+
+      async function resetPacked() {
+        if (!confirm("Stop evaluation and move the robot to the packed position?")) return;
+        await api("/api/reset_packed", {});
+        await refreshStatus();
+      }
+
+      async function disconnectAll() {
+        await api("/api/disconnect", {});
+        await refreshStatus();
+      }
+
+      function boolText(value) {
+        return value ? '<span class="ok">yes</span>' : '<span class="bad">no</span>';
+      }
+
+      async function refreshStatus() {
+        try {
+          const status = await api("/api/status");
+          await renderStatus(status);
+        } catch (error) {
+          $("log").textContent += `\nUI error: ${error.message}`;
+        }
+      }
+
+      async function renderStatus(status) {
+        $("top_camera_status").innerHTML = formatCameraStatus(status.top_camera, status.top_camera_connected ?? status.camera_connected);
+        $("side_camera_status").innerHTML = status.side_camera
+          ? formatCameraStatus(status.side_camera, status.side_camera_connected)
+          : "fallback to top";
+        $("robot_status").innerHTML = boolText(status.robot_connected);
+        $("running_status").innerHTML = status.running ? '<span class="warn">yes</span>' : "no";
+        $("program_status").innerHTML = status.program_mode ? '<span class="warn">torque off</span>' : "no";
+        $("conversion_status").innerHTML = status.apply_joint_conversion ? '<span class="ok">on</span>' : "off";
+        $("sync_status").textContent =
+          status.last_image_state_skew_ms == null
+            ? "n/a"
+            : `obs ${status.last_observation_id ?? "?"}->act ${status.last_action_observation_id ?? "?"}, ${
+                status.last_image_state_skew_ms.toFixed(0)
+              } ms img/joint, ${status.last_camera_skew_ms?.toFixed(0) ?? "?"} ms cam, ${status.last_side_camera_source ?? "?"}`;
+        $("endpoint_status").innerHTML = status.server_metadata
+          ? `<span class="ok">${status.server_metadata.repo_id || "ok"}</span>`
+          : "unchecked";
+        $("inference_status").textContent = status.last_inference_ms
+          ? `${status.last_inference_ms.toFixed(0)} ms local, ${status.last_server_dt_ms ?? "?"} ms server`
+          : "n/a";
+        $("action_status").textContent = status.last_action
+          ? `${status.last_action.map((v) => Number(v).toFixed(1)).join(", ")}; smooth ${
+              status.interpolation_steps ?? "?"
+            }x alpha ${status.smoothing_alpha ?? "?"}${formatWorstActionError(status.last_action_error)}`
+          : "n/a";
+        renderJointPositions(status.joint_positions);
+        $("log").textContent = status.logs.join("\n");
+        if (status.last_error) {
+          $("log").textContent += `\nERROR: ${status.last_error}`;
+        }
+        if (status.top_camera_connected ?? status.camera_connected) {
+          $("top_preview").src = `/api/frame.jpg?slot=top&t=${Date.now()}`;
+        }
+        if (status.side_camera_connected) {
+          $("side_preview").src = `/api/frame.jpg?slot=side&t=${Date.now()}`;
+        }
+      }
+
+      function renderJointPositions(positions) {
+        const tbody = $("joint_positions");
+        if (!positions) {
+          tbody.innerHTML = '<tr><td colspan="2">Connect robot to read joints</td></tr>';
+          return;
+        }
+        const names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"];
+        tbody.innerHTML = names
+          .map((name) => `<tr><td>${name}</td><td>${Number(positions[name]).toFixed(2)}</td></tr>`)
+          .join("");
+      }
+
+      function formatCameraStatus(camera, connected) {
+        if (!camera) return boolText(false);
+        const state = connected ? '<span class="ok">fresh</span>' : '<span class="bad">stale</span>';
+        const shape = camera.width && camera.height ? `${camera.width}x${camera.height}` : "?";
+        const age = camera.frame_age_ms == null ? "?" : `${camera.frame_age_ms.toFixed(0)}ms`;
+        return `${state} idx ${camera.index} ${shape} age ${age}`;
+      }
+
+      function syncConnectedCameraSelection(slot, camera) {
+        if (!camera || camera.index == null) return;
+        const value = String(camera.index);
+        const select = $(`${slot}_camera_select`);
+        if ([...select.options].some((option) => option.value === value)) {
+          select.value = value;
+        }
+        $(`${slot}_camera_index`).value = value;
+      }
+
+      function formatWorstActionError(errors) {
+        if (!errors) return "";
+        let worst = null;
+        for (const [joint, value] of Object.entries(errors)) {
+          const numericValue = Number(value);
+          if (!worst || numericValue > worst.value) {
+            worst = { joint, value: numericValue };
+          }
+        }
+        return worst ? `; err ${worst.value.toFixed(1)} ${worst.joint}` : "";
+      }
+
+      loadSettings();
+      installSettingsPersistence();
+      refreshDevices()
+        .then(autoConnectSaved)
+        .catch((error) => {
+          $("log").textContent = `Startup error: ${error.message}`;
+        });
+      setInterval(refreshStatus, 1000);
+    </script>
+  </body>
+</html>
