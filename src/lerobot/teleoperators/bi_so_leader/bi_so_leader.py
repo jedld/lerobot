@@ -44,12 +44,30 @@ class BiSOLeader(BimanualMixin, Teleoperator):
             id=f"{config.id}_left" if config.id else None,
             calibration_dir=config.calibration_dir,
             port=config.left_arm_config.port,
+            use_degrees=config.left_arm_config.use_degrees,
+            gripper_force_feedback=config.left_arm_config.gripper_force_feedback,
+            gripper_force_feedback_gain=config.left_arm_config.gripper_force_feedback_gain,
+            gripper_force_feedback_position_margin=config.left_arm_config.gripper_force_feedback_position_margin,
+            gripper_force_feedback_load_deadband=config.left_arm_config.gripper_force_feedback_load_deadband,
+            gripper_force_feedback_max_overshoot=config.left_arm_config.gripper_force_feedback_max_overshoot,
+            gripper_force_feedback_release_hysteresis=config.left_arm_config.gripper_force_feedback_release_hysteresis,
+            gripper_force_feedback_torque_limit_min=config.left_arm_config.gripper_force_feedback_torque_limit_min,
+            gripper_force_feedback_torque_limit_max=config.left_arm_config.gripper_force_feedback_torque_limit_max,
         )
 
         right_arm_config = SOLeaderTeleopConfig(
             id=f"{config.id}_right" if config.id else None,
             calibration_dir=config.calibration_dir,
             port=config.right_arm_config.port,
+            use_degrees=config.right_arm_config.use_degrees,
+            gripper_force_feedback=config.right_arm_config.gripper_force_feedback,
+            gripper_force_feedback_gain=config.right_arm_config.gripper_force_feedback_gain,
+            gripper_force_feedback_position_margin=config.right_arm_config.gripper_force_feedback_position_margin,
+            gripper_force_feedback_load_deadband=config.right_arm_config.gripper_force_feedback_load_deadband,
+            gripper_force_feedback_max_overshoot=config.right_arm_config.gripper_force_feedback_max_overshoot,
+            gripper_force_feedback_release_hysteresis=config.right_arm_config.gripper_force_feedback_release_hysteresis,
+            gripper_force_feedback_torque_limit_min=config.right_arm_config.gripper_force_feedback_torque_limit_min,
+            gripper_force_feedback_torque_limit_max=config.right_arm_config.gripper_force_feedback_torque_limit_max,
         )
 
         self.left_arm = SOLeader(left_arm_config)
@@ -88,5 +106,8 @@ class BiSOLeader(BimanualMixin, Teleoperator):
         return action_dict
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO: Implement force feedback
-        raise NotImplementedError
+        # Namespace feedback keys back to per-arm format and delegate to each arm.
+        left_feedback = {k.removeprefix("left_"): v for k, v in feedback.items() if k.startswith("left_")}
+        right_feedback = {k.removeprefix("right_"): v for k, v in feedback.items() if k.startswith("right_")}
+        self.left_arm.send_feedback(left_feedback)
+        self.right_arm.send_feedback(right_feedback)

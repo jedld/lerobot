@@ -20,9 +20,11 @@ from .config_so_leader import (
     SOLeaderConfig,
     SOLeaderTeleopConfig,
 )
+from .force_feedback import GripperFeedbackState, apply_gripper_force_feedback
 from .so_leader import SO100Leader, SO101Leader, SOLeader
 
 __all__ = [
+    "GripperFeedbackState",
     "SO100Leader",
     "SO100LeaderConfig",
     "SO101Leader",
@@ -30,4 +32,20 @@ __all__ = [
     "SOLeader",
     "SOLeaderConfig",
     "SOLeaderTeleopConfig",
+    "apply_gripper_force_feedback",
+    "pair_leader_with_follower",
 ]
+
+
+def pair_leader_with_follower(leader, follower) -> None:
+    """Pair a SOLeader with its follower robot for force feedback.
+
+    This sets the ``_follower`` attribute on the leader so that
+    :meth:`SOLeader._apply_gripper_force_feedback` can read the
+    follower's gripper position and load.
+
+    Args:
+        leader: A ``SOLeader`` (or subclass) instance.
+        follower: A robot instance with a ``bus`` attribute (e.g. ``SOFollower``).
+    """
+    leader._follower = follower

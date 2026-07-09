@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import time
 
@@ -26,6 +27,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..teleoperator import Teleoperator
 from .config_so_leader import SOLeaderTeleopConfig
+from .force_feedback import GripperFeedbackState, apply_gripper_force_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,9 @@ class SOLeader(Teleoperator):
             },
             calibration=self.calibration,
         )
+
+        # Gripper force feedback state (only used when config.gripper_force_feedback is True).
+        self._gripper_feedback_state = GripperFeedbackState()
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -130,6 +135,12 @@ class SOLeader(Teleoperator):
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
+        # Configure gripper motor for force feedback mode if enabled.
+        if self.config.gripper_force_feedback:
+            self._setup_leader_gripper_for_force_feedback()
+            self._gripper_feedback_state.reset()
+            logger.info("Gripper force feedback enabled (gain=%.2f)", self.config.gripper_force_feedback_gain)
+
     def enable_torque(self) -> None:
         self.bus.enable_torque()
 
@@ -154,11 +165,79 @@ class SOLeader(Teleoperator):
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
         goals = {k.removesuffix(".pos"): v for k, v in feedback.items() if k.endswith(".pos")}
-        if goals:
-            self.bus.sync_write("Goal_Position", goals)
+        if not goals:
+            return
+
+        # --- Gripper force feedback ---
+        if self.config.gripper_force_feedback:
+            goals = self._apply_gripper_force_feedback(goals)
+
+        self.bus.sync_write("Goal_Position", goals)
+
+    def _setup_leader_gripper_for_force_feedback(self) -> None:
+        """Configure the leader gripper motor for compliant force feedback.
+
+        Sets PD coefficients so the gripper can be pushed open by the operator
+        while the controller applies resisting torque.
+        """
+        gripper_motor = "gripper"
+        self.bus.write("P_Coefficient", gripper_motor, 8)
+        self.bus.write("I_Coefficient", gripper_motor, 0)
+        self.bus.write("D_Coefficient", gripper_motor, 20)
+        self.bus.disable_torque(motors=[gripper_motor])
+
+    def _apply_gripper_force_feedback(self, goals: dict[str, float]) -> dict[str, float]:
+        """Apply gripper force feedback and return (possibly modified) goals.
+
+        Reads follower state via the robot interface, computes virtual-wall
+        goal and torque-limit for the leader gripper, and dispatches bus
+        writes only on state transitions.
+        """
+        try:
+            # Read follower state — we need a reference to the follower robot.
+            # The follower is stored as _follower on SOLeader when set up by
+            # a pairing context (e.g. rollout strategies, lerobot-teleoperate).
+            follower = getattr(self, "_follower", None)
+            if follower is None:
+                # No follower reference available; skip force feedback.
+                return goals
+
+            follower_bus = getattr(follower, "bus", None)
+            if follower_bus is None:
+                return goals
+
+            try:
+                follower_load = follower_bus.sync_read("Present_Load", ["gripper"])["gripper"]
+                follower_pos = follower_bus.sync_read("Present_Position", ["gripper"])["gripper"]
+            except Exception as e:
+                logger.debug("Gripper force feedback read failed: %s", e)
+                return goals
+
+            leader_present = goals.get("gripper", 0.0)
+            goal = apply_gripper_force_feedback(
+                feedback_state=self._gripper_feedback_state,
+                follower_load=follower_load,
+                follower_pos=float(follower_pos),
+                leader_present=leader_present,
+                gain=self.config.gripper_force_feedback_gain,
+                config=self.config,
+                bus=self.bus,
+            )
+            goals["gripper"] = goal
+
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Gripper force feedback error: %s", e)
+
+        return goals
 
     @check_if_not_connected
     def disconnect(self) -> None:
+        # Disable torque on the gripper motor before disconnecting.
+        if self.config.gripper_force_feedback:
+            with contextlib.suppress(Exception):
+                self.bus.disable_torque(motors=["gripper"])
+            self._gripper_feedback_state.reset()
+
         self.bus.disconnect()
         logger.info(f"{self} disconnected.")
 
