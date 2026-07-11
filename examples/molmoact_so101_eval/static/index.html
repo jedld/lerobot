@@ -175,13 +175,16 @@
     <main>
       <section>
         <h1>MolmoAct2 SO-ARM101 Evaluation</h1>
-        <p class="note">
+        <p class="note" id="camera_note">
           This UI can send two local webcams as <code>top_cam</code> and <code>side_cam</code>
           to the deployed SO100/SO101 MolmoAct2 endpoint. If only Top is connected, it is
           duplicated into both inputs.
         </p>
 
         <h2>Inference</h2>
+        <div class="pill" style="margin-bottom: 10px">
+          <strong>Backend</strong><span id="backend_status">unknown</span>
+        </div>
         <label>
           Endpoint
           <input id="endpoint" value="http://192.168.0.233:8014/act" />
@@ -575,6 +578,15 @@
       }
 
       async function renderStatus(status) {
+        const localBackend = status.inference_mode === "local";
+        $("backend_status").innerHTML = localBackend
+          ? '<span class="ok">local managed</span>'
+          : '<span class="warn">remote endpoint</span>';
+        $("endpoint").value = status.endpoint || $("endpoint").value;
+        $("endpoint").readOnly = localBackend;
+        $("camera_note").innerHTML = localBackend
+          ? 'Local mode maps Top → <code>front_cam</code> and Side → <code>wrist_cam</code> for the upstream MolmoAct2 SO-101 server. If only Top is connected, it is duplicated into both inputs.'
+          : 'This UI can send two local webcams as <code>top_cam</code> and <code>side_cam</code> to the deployed SO100/SO101 MolmoAct2 endpoint. If only Top is connected, it is duplicated into both inputs.';
         $("top_camera_status").innerHTML = formatCameraStatus(status.top_camera, status.top_camera_connected ?? status.camera_connected);
         $("side_camera_status").innerHTML = status.side_camera
           ? formatCameraStatus(status.side_camera, status.side_camera_connected)

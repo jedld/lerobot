@@ -46,6 +46,7 @@ from numpy.typing import NDArray
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 DEFAULT_ENDPOINT = "http://192.168.0.233:8014/act"
+DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:8101/act"
 DEFAULT_ROBOT_ID = "jedld-follower"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7860
@@ -355,6 +356,12 @@ def clip_action_to_step(action: NDArray[np.float32], current_state: NDArray[np.f
     return current_state + delta * (max_step_deg / biggest)
 
 
+def build_max_relative_target(max_arm: float | None) -> float | dict[str, float] | None:
+    if max_arm is None:
+        return None
+    return {name: (100.0 if name == "gripper" else max_arm) for name in ACTION_NAMES}
+
+
 def arm_state_to_model_frame(state: NDArray[np.float32]) -> NDArray[np.float32]:
     return JOINT_SIGNS * state + JOINT_OFFSETS
 
@@ -363,9 +370,34 @@ def model_actions_to_arm_frame(actions: NDArray[np.float32]) -> NDArray[np.float
     return (actions - JOINT_OFFSETS) * JOINT_SIGNS
 
 
+def build_inference_payload(
+    *,
+    inference_schema: str,
+    top_frame: NDArray[Any],
+    side_frame: NDArray[Any],
+    instruction: str,
+    state: NDArray[np.float32],
+) -> dict[str, Any]:
+    if inference_schema == "front_wrist":
+        return {
+            "front_cam": top_frame,
+            "wrist_cam": side_frame,
+            "instruction": instruction,
+            "state": state,
+        }
+    return {
+        "top_cam": top_frame,
+        "side_cam": side_frame,
+        "instruction": instruction,
+        "state": state,
+    }
+
+
 @dataclass
 class AppState:
     endpoint: str = DEFAULT_ENDPOINT
+    inference_mode: str = "remote"
+    inference_schema: str = "top_side"
     instruction: str = "pick up the object"
     robot_id: str = DEFAULT_ROBOT_ID
     action_fps: float = DEFAULT_FPS
@@ -445,6 +477,8 @@ class AppState:
         with self.lock:
             return {
                 "endpoint": self.endpoint,
+                "inference_mode": self.inference_mode,
+                "inference_schema": self.inference_schema,
                 "instruction": self.instruction,
                 "robot_id": self.robot_id,
                 "robot_connected": self.robot_connected,
@@ -541,7 +575,7 @@ class AppState:
                 port=port,
                 id=robot_id,
                 cameras={},
-                max_relative_target=max_relative_target,
+                max_relative_target=build_max_relative_target(max_relative_target),
                 use_degrees=True,
             )
             robot = SO101Follower(config)
@@ -660,12 +694,13 @@ class AppState:
         frame_age_ms = max(top_age_ms, side_age_ms)
         state = arm_state_to_model_frame(arm_state) if self.apply_joint_conversion else arm_state
         task = instruction if instruction is not None else self.instruction
-        payload = {
-            "top_cam": top_frame,
-            "side_cam": side_frame,
-            "instruction": task,
-            "state": state,
-        }
+        payload = build_inference_payload(
+            inference_schema=self.inference_schema,
+            top_frame=top_frame,
+            side_frame=side_frame,
+            instruction=task,
+            state=state,
+        )
         start = time.perf_counter()
         response = requests.post(
             self.endpoint,
@@ -1008,6 +1043,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST, help="Host interface for the local web UI.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port for the local web UI.")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="MolmoAct2 /act endpoint URL.")
+    parser.add_argument(
+        "--inference-mode",
+        choices=["remote", "local"],
+        default="remote",
+        help="Remote HTTP endpoint (default) or locally managed MolmoAct2 inference.",
+    )
+    parser.add_argument(
+        "--inference-schema",
+        choices=["top_side", "front_wrist"],
+        default="top_side",
+        help="Camera field names sent to the inference endpoint.",
+    )
     parser.add_argument("--robot-id", default=DEFAULT_ROBOT_ID, help="LeRobot calibration id for the SO-101.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
@@ -1016,8 +1063,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s:%(name)s:%(message)s")
-    state = AppState(endpoint=args.endpoint, robot_id=args.robot_id)
+    state = AppState(
+        endpoint=args.endpoint,
+        robot_id=args.robot_id,
+        inference_mode=args.inference_mode,
+        inference_schema=args.inference_schema,
+    )
     server = MolmoActHTTPServer((args.host, args.port), Handler, state)
+    if args.inference_mode == "local":
+        state.log(f"Local MolmoAct2 inference via {args.endpoint} ({args.inference_schema} camera schema).")
     state.log(f"Open http://{args.host}:{args.port} to evaluate MolmoAct2 on SO-ARM101.")
     try:
         server.serve_forever()

@@ -1,28 +1,77 @@
 # MolmoAct2 SO-ARM101 Evaluation UI
 
-This example provides a local browser UI for evaluating the deployed
-`allenai/MolmoAct2-SO100_101` inference server on an SO-ARM101 follower.
+This example provides a local browser UI for evaluating
+`allenai/MolmoAct2-SO100_101` on an SO-ARM101 follower.
 
-It is configured for:
+Two inference backends are supported:
 
-- MolmoAct2 endpoint: `http://192.168.0.233:8014/act`
-- LeRobot calibration id: `jedld-follower`
-- One or two local OpenCV webcams. Use `640x480` for lower latency preview and
-  inference requests.
-- Camera dropdowns are labeled by OpenCV index because macOS AVFoundation names
-  can disagree with the indices OpenCV actually opens.
-- SO100/SO101 server schema: `top_cam`, `side_cam`, `instruction`, `state`
+- **Local (recommended on Halo Strix)** — auto-starts the upstream
+  [`molmoact2`](https://github.com/allenai/molmoact2) SO-101 server from
+  `~/workspace/molmoact2` using its ROCm-aware launcher. No separate manual
+  inference-server step.
+- **Remote** — talks to an existing HTTP `/act` endpoint (json-numpy wire
+  format).
 
-The deployed checkpoint expects two camera inputs. Connect **Top Webcam** and
-optionally **Side Webcam** to send different frames as `top_cam` and `side_cam`.
-If only Top is connected, this UI duplicates the Top frame into both fields.
+Defaults live in `default.env`:
+
+- Inference mode: `local`
+- MolmoAct2 repo: `~/workspace/molmoact2`
+- LeRobot calibration id: `my_awesome_follower_arm`
+- One or two local OpenCV webcams at `640x480`
+
+Camera mapping:
+
+- **Local mode:** Top → `front_cam`, Side → `wrist_cam`
+- **Remote mode:** Top → `top_cam`, Side → `side_cam`
+
+If only Top is connected, the UI duplicates that frame into both camera inputs.
 
 ## Run
 
 From the LeRobot repo root:
 
 ```bash
-uv run python examples/molmoact_so101_eval/server.py
+./examples/molmoact_so101_eval/run_eval.sh
+```
+
+With `MOLMOACT_INFERENCE=local` in `default.env`, this will:
+
+1. Start `molmoact2/examples/so101/start_server.sh` (ROCm-friendly on AMD Strix)
+2. Wait for the model to load on `http://127.0.0.1:8101/act`
+3. Launch the browser UI on `http://127.0.0.1:7860`
+4. Stop the local inference server when you exit the UI
+
+First-time setup on Halo Strix (in the molmoact2 repo):
+
+```bash
+cd ~/workspace/molmoact2
+sudo ./examples/so101/install_rocm_system.sh   # once
+./examples/so101/setup_amd.sh                  # once
+```
+
+Override settings in `default.env` or create an untracked `.env.local`. CLI
+flags are forwarded to the UI server, e.g. `--port 8080`.
+
+Force a mode from the CLI:
+
+```bash
+./examples/molmoact_so101_eval/run_eval.sh --local
+./examples/molmoact_so101_eval/run_eval.sh --remote
+```
+
+You can also run the launcher directly:
+
+```bash
+uv run --extra feetech python examples/molmoact_so101_eval/run_eval.py --local
+```
+
+Or start only the UI (remote endpoint or an already-running local server):
+
+```bash
+uv run --extra feetech python examples/molmoact_so101_eval/server.py \
+  --endpoint http://127.0.0.1:8101/act \
+  --inference-mode local \
+  --inference-schema front_wrist
 ```
 
 Then open:
@@ -61,8 +110,11 @@ http://127.0.0.1:7860
 - `Max Step Deg` follows the SO-101 reference implementation's vector-scaled
   per-tick action cap. If any joint would move farther than the cap, the whole
   action delta is scaled down proportionally.
-- `Robot Safety Clamp` is also passed into LeRobot's `max_relative_target`,
-  giving a second hardware-side clamp.
+- `Robot Safety Clamp` is passed into LeRobot's `max_relative_target` for arm
+  joints only. The gripper keeps the full 0-100 travel so close commands are
+  not clipped to 10 units per tick.
+- Gripper values use the same LeRobot 0-100 scale as the follower; only the
+  five arm joints get the v3.0 → v2.1 frame conversion.
 - Evaluation is synchronous and does not use async temporal ensembling. The
   default loop is observe -> infer -> execute the returned chunk -> observe
   again.
