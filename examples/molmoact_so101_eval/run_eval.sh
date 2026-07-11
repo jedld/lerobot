@@ -6,4 +6,4 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 cd "${REPO_ROOT}"
 
-exec uv run --extra feetech python "${SCRIPT_DIR}/run_eval.py" "$@"
+exec uv run --extra feetech --extra pi python "${SCRIPT_DIR}/run_eval.py" "$@"

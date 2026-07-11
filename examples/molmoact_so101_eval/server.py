@@ -14,11 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local web UI for evaluating MolmoAct2-SO100_101 on an SO-ARM101 follower.
+"""Local web UI for evaluating MolmoAct2 or Pi policies on an SO-ARM101 follower.
 
-The MolmoAct2 model is expected to be hosted separately at a FastAPI-style
-`/act` endpoint using the json-numpy wire format. This app owns only local I/O:
-webcam capture, SO-101 joint reads/writes, and a small browser UI.
+The policy is expected to be hosted separately at a FastAPI-style `/act` endpoint
+using the json-numpy wire format. This app owns only local I/O: webcam capture,
+SO-101 joint reads/writes, and a small browser UI.
+
+Pi 0.7 weights are not publicly released yet. Use open-source LeRobot pi05/pi0
+checkpoints via ``--policy pi`` (see ``host_server_pi.py`` for local inference).
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import cv2  # type: ignore[import-untyped]
 import numpy as np
@@ -46,29 +49,42 @@ from numpy.typing import NDArray
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 DEFAULT_ENDPOINT = "http://192.168.0.233:8014/act"
-DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:8101/act"
+DEFAULT_LOCAL_PI_ENDPOINT = "http://127.0.0.1:8102/act"
 DEFAULT_ROBOT_ID = "jedld-follower"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7860
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
 DEFAULT_FPS = 30
+DEFAULT_PREVIEW_FPS = 12
+DEFAULT_PREVIEW_JPEG_QUALITY = 65
+DEFAULT_PREVIEW_MAX_WIDTH = 640
+MIN_PREVIEW_FPS = 1
+MAX_PREVIEW_FPS = 30
+MIN_PREVIEW_JPEG_QUALITY = 30
+MAX_PREVIEW_JPEG_QUALITY = 90
 DEFAULT_MAX_RELATIVE_TARGET = 10.0
 DEFAULT_MAX_STEP_DEG = 15.0
 DEFAULT_TIMEOUT_S = 60.0
+# Pi may use EMA action mixing; MolmoAct2 is forced to fully open-loop (alpha=1.0).
 DEFAULT_SMOOTHING_ALPHA = 0.8
+DEFAULT_SMOOTHING_ALPHA_OPEN_LOOP = 1.0
 DEFAULT_INTERPOLATION_STEPS = 3
 
 ACTION_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 JOINT_OFFSETS = np.asarray([0.0, 90.0, 90.0, 0.0, 0.0, 0.0], dtype=np.float32)
 JOINT_SIGNS = np.asarray([1.0, -1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+# MolmoAct2-SO100_101 research start pose: state q50 from the checkpoint
+# ``norm_stats.json`` tag ``so100_so101_molmoact2`` (model / v2.1 frame), converted
+# to the LeRobot v3 arm frame via ``(model - offsets) * signs``. This matches the
+# training-median alignment used for MolmoAct2 SO-100/101 deployment.
+_MOLMOACT2_START_MODEL_FRAME = np.asarray(
+    [3.066375725640164, 123.16482094240277, 124.39930058290133, 57.88605464633133, -11.037436711677765, 9.241478261568748],
+    dtype=np.float32,
+)
+_MOLMOACT2_START_ARM_FRAME = (_MOLMOACT2_START_MODEL_FRAME - JOINT_OFFSETS) * JOINT_SIGNS
 HOME_ACTION = {
-    "shoulder_pan": 0.0,
-    "shoulder_lift": 0.0,
-    "elbow_flex": 0.0,
-    "wrist_flex": 0.0,
-    "wrist_roll": 0.0,
-    "gripper": 50.0,
+    name: float(value) for name, value in zip(ACTION_NAMES, _MOLMOACT2_START_ARM_FRAME, strict=True)
 }
 PACKED_ACTION = {
     "shoulder_pan": -0.3076923076923077,
@@ -124,6 +140,37 @@ def parse_optional_positive_int(value: Any) -> int | None:
     if parsed < 1:
         return None
     return parsed
+
+
+def is_open_loop_policy(policy: str) -> bool:
+    """MolmoAct2 runs fully open-loop: full chunk, no EMA mixing, no RTC."""
+    return policy == "molmoact2"
+
+
+def resolve_execution_settings(
+    policy: str,
+    *,
+    actions_per_chunk: int | None,
+    smoothing_alpha: float,
+) -> tuple[int | None, float, list[str]]:
+    """Return execution settings, forcing open-loop for MolmoAct2.
+
+    Open-loop means: execute the entire returned action chunk with no EMA
+    blending across actions/chunks and no real-time chunking / leftover mixing.
+    """
+    notes: list[str] = []
+    if not is_open_loop_policy(policy):
+        return actions_per_chunk, float(np.clip(smoothing_alpha, 0.05, 1.0)), notes
+
+    if actions_per_chunk is not None:
+        notes.append(
+            "MolmoAct2 open-loop mode ignores Actions Per Chunk; executing the full returned chunk."
+        )
+    if float(smoothing_alpha) < DEFAULT_SMOOTHING_ALPHA_OPEN_LOOP:
+        notes.append(
+            "MolmoAct2 open-loop mode disables EMA action mixing (smoothing_alpha=1.0)."
+        )
+    return None, DEFAULT_SMOOTHING_ALPHA_OPEN_LOOP, notes
 
 
 def list_serial_ports() -> list[str]:
@@ -235,9 +282,12 @@ class LocalOpenCVCamera:
         self.fps = fps
         self.capture: cv2.VideoCapture | None = None
         self.frame_lock = threading.Lock()
+        self.frame_condition = threading.Condition(self.frame_lock)
         self.capture_lock = threading.Lock()
+        self.jpeg_lock = threading.Lock()
         self.latest_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
+        self.jpeg_cache: dict[tuple[float, int, int], bytes] = {}
         self.stop_event = threading.Event()
         self.new_frame_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -321,6 +371,45 @@ class LocalOpenCVCamera:
             )
         return frame.copy()
 
+    def read_jpeg(
+        self,
+        *,
+        after_timestamp: float | None,
+        timeout_s: float,
+        quality: int,
+        max_width: int,
+    ) -> tuple[float, bytes]:
+        """Wait for a newer frame and return a cached, bandwidth-limited JPEG."""
+        with self.frame_condition:
+            if after_timestamp is not None:
+                self.frame_condition.wait_for(
+                    lambda: self.latest_timestamp is not None and self.latest_timestamp != after_timestamp,
+                    timeout=timeout_s,
+                )
+            frame = self.latest_frame
+            timestamp = self.latest_timestamp
+            if frame is None or timestamp is None:
+                raise RuntimeError(f"OpenCV camera index {self.index} has not captured a frame yet.")
+            frame = frame.copy()
+
+        cache_key = (timestamp, quality, max_width)
+        with self.jpeg_lock:
+            cached = self.jpeg_cache.get(cache_key)
+            if cached is not None:
+                return timestamp, cached
+            height, width = frame.shape[:2]
+            if max_width > 0 and width > max_width:
+                output_height = max(1, round(height * max_width / width))
+                frame = cv2.resize(frame, (max_width, output_height), interpolation=cv2.INTER_AREA)
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not ok:
+                raise RuntimeError("Failed to encode camera frame.")
+            data = encoded.tobytes()
+            self.jpeg_cache = {key: value for key, value in self.jpeg_cache.items() if key[0] == timestamp}
+            self.jpeg_cache[cache_key] = data
+            return timestamp, data
+
     def read(self) -> NDArray[Any]:
         previous_timestamp = self.latest_timestamp
         deadline = time.perf_counter() + 2.0
@@ -342,9 +431,10 @@ class LocalOpenCVCamera:
                 time.sleep(0.05)
                 continue
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            with self.frame_lock:
+            with self.frame_condition:
                 self.latest_frame = rgb_frame
                 self.latest_timestamp = time.perf_counter()
+                self.frame_condition.notify_all()
             self.new_frame_event.set()
 
 
@@ -368,6 +458,36 @@ def arm_state_to_model_frame(state: NDArray[np.float32]) -> NDArray[np.float32]:
 
 def model_actions_to_arm_frame(actions: NDArray[np.float32]) -> NDArray[np.float32]:
     return (actions - JOINT_OFFSETS) * JOINT_SIGNS
+
+
+def raise_for_status_with_body(response: requests.Response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = response.text[:500]
+        try:
+            decoded = json.loads(response.text, object_hook=json_numpy_object_hook)
+            if isinstance(decoded, dict) and decoded.get("error"):
+                detail = str(decoded["error"])
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"HTTP {response.status_code} from {response.url}: {detail}") from exc
+
+
+def validate_pi_server_metadata(metadata: dict[str, Any]) -> str | None:
+    state_dim = metadata.get("state_dim")
+    action_dim = metadata.get("action_dim")
+    if state_dim == 32 and action_dim == 32:
+        return (
+            "Remote Pi server expects state/action dim 32 (raw pi05 tensors). "
+            "Redeploy examples/molmoact_so101_eval/host_server_pi.py from this repo — "
+            "SO-101 eval sends 6 joint values and expects actions shaped (N, 6)."
+        )
+    if state_dim not in (None, len(ACTION_NAMES)):
+        return f"Remote Pi server state_dim={state_dim}; expected {len(ACTION_NAMES)} for SO-101."
+    if action_dim not in (None, len(ACTION_NAMES)):
+        return f"Remote Pi server action_dim={action_dim}; expected {len(ACTION_NAMES)} for SO-101."
+    return None
 
 
 def build_inference_payload(
@@ -396,6 +516,7 @@ def build_inference_payload(
 @dataclass
 class AppState:
     endpoint: str = DEFAULT_ENDPOINT
+    policy: str = "molmoact2"
     inference_mode: str = "remote"
     inference_schema: str = "top_side"
     instruction: str = "pick up the object"
@@ -434,6 +555,11 @@ class AppState:
     command_lock: threading.Lock = field(default_factory=threading.Lock)
     stop_event: threading.Event = field(default_factory=threading.Event)
     eval_thread: threading.Thread | None = None
+
+    def __post_init__(self) -> None:
+        if is_open_loop_policy(self.policy):
+            self.actions_per_chunk = None
+            self.smoothing_alpha = DEFAULT_SMOOTHING_ALPHA_OPEN_LOOP
 
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -477,6 +603,7 @@ class AppState:
         with self.lock:
             return {
                 "endpoint": self.endpoint,
+                "policy": self.policy,
                 "inference_mode": self.inference_mode,
                 "inference_schema": self.inference_schema,
                 "instruction": self.instruction,
@@ -494,6 +621,7 @@ class AppState:
                 "actions_per_chunk": self.actions_per_chunk,
                 "smoothing_alpha": self.smoothing_alpha,
                 "interpolation_steps": self.interpolation_steps,
+                "open_loop": is_open_loop_policy(self.policy),
                 "apply_joint_conversion": self.apply_joint_conversion,
                 "joint_positions": self.last_joint_positions,
                 "last_action": self.last_action,
@@ -515,8 +643,14 @@ class AppState:
 
     def refresh_endpoint_metadata(self) -> dict[str, Any]:
         response = requests.get(self.endpoint, timeout=5)
-        response.raise_for_status()
+        raise_for_status_with_body(response)
         metadata = response.json()
+        if self.policy == "pi":
+            warning = validate_pi_server_metadata(metadata)
+            if warning:
+                self.log(f"Endpoint warning: {warning}")
+                with self.lock:
+                    self.last_error = warning
         with self.lock:
             self.server_metadata = metadata
         return metadata
@@ -609,6 +743,25 @@ class AppState:
         if camera is None or not camera.is_connected:
             raise RuntimeError(f"{slot.capitalize()} camera is not connected.")
         return camera.read_latest(max_age_ms=1000)
+
+    def get_preview_jpeg(
+        self,
+        *,
+        slot: str,
+        after_timestamp: float | None,
+        timeout_s: float,
+        quality: int,
+        max_width: int,
+    ) -> tuple[float, bytes]:
+        camera = self.top_camera if slot == "top" else self.side_camera
+        if camera is None or not camera.is_connected:
+            raise RuntimeError(f"{slot.capitalize()} camera is not connected.")
+        return camera.read_jpeg(
+            after_timestamp=after_timestamp,
+            timeout_s=timeout_s,
+            quality=quality,
+            max_width=max_width,
+        )
 
     def read_fresh_frame(self, *, slot: str = "top") -> tuple[NDArray[Any], float, float]:
         camera = self.top_camera if slot == "top" else self.side_camera
@@ -709,7 +862,7 @@ class AppState:
             timeout=self.request_timeout_s,
         )
         elapsed_ms = (time.perf_counter() - start) * 1e3
-        response.raise_for_status()
+        raise_for_status_with_body(response)
         decoded = json.loads(response.text, object_hook=json_numpy_object_hook)
         actions = np.asarray(decoded["actions"], dtype=np.float32)
         if actions.ndim != 2 or actions.shape[1] != len(ACTION_NAMES):
@@ -735,16 +888,25 @@ class AppState:
         if robot is None or not robot.is_connected:
             raise RuntimeError("Robot is not connected.")
         control_period_s = 1.0 / max(self.action_fps * self.interpolation_steps, 1.0)
-        actions_to_execute = actions if self.actions_per_chunk is None else actions[: self.actions_per_chunk]
-        smoothed_target = self.smoothed_action_target
+        # MolmoAct2 open-loop always consumes the full returned chunk (no mid-horizon replan).
+        if is_open_loop_policy(self.policy):
+            actions_to_execute = actions
+            alpha = DEFAULT_SMOOTHING_ALPHA_OPEN_LOOP
+        else:
+            actions_to_execute = actions if self.actions_per_chunk is None else actions[: self.actions_per_chunk]
+            alpha = float(np.clip(self.smoothing_alpha, 0.05, 1.0))
+        smoothed_target = None if alpha >= 1.0 else self.smoothed_action_target
         for action in actions_to_execute:
             if self.stop_event.is_set():
                 break
             current = self.get_state_vector()
-            if smoothed_target is None:
-                smoothed_target = current
-            alpha = float(np.clip(self.smoothing_alpha, 0.05, 1.0))
-            smoothed_target = (alpha * action + (1.0 - alpha) * smoothed_target).astype(np.float32)
+            if alpha >= 1.0:
+                # Fully open-loop: execute the model action as-is (no EMA mixing).
+                smoothed_target = action.astype(np.float32, copy=False)
+            else:
+                if smoothed_target is None:
+                    smoothed_target = current
+                smoothed_target = (alpha * action + (1.0 - alpha) * smoothed_target).astype(np.float32)
             start_state = current
             sent_target = start_state
             step_start = time.perf_counter()
@@ -771,19 +933,19 @@ class AppState:
             with self.lock:
                 self.last_action = sent_target.astype(float).tolist()
                 self.last_action_settle_ms = None
-                self.smoothed_action_target = smoothed_target
+                self.smoothed_action_target = None if alpha >= 1.0 else smoothed_target
 
     def infer_once(self, *, execute: bool, instruction: str | None = None) -> dict[str, Any]:
         actions = self.request_actions(instruction=instruction)
         if execute:
             self.execute_actions(actions)
-            self.log(f"Executed {len(actions)} MolmoAct2 actions.")
+            self.log(f"Executed {len(actions)} {self.policy} actions.")
         else:
             self.log(f"Dry-run inference returned {len(actions)} actions.")
         return self.status()
 
     def reset_home(self) -> dict[str, Any]:
-        return self.move_to_pose("home", HOME_ACTION)
+        return self.move_to_pose("start", HOME_ACTION)
 
     def reset_packed(self) -> dict[str, Any]:
         return self.move_to_pose("packed", PACKED_ACTION)
@@ -842,21 +1004,34 @@ class AppState:
         if self.command_lock.locked():
             raise RuntimeError("Robot is busy finishing another command. Wait for it to complete before starting evaluation.")
         self.ensure_torque_enabled()
+        resolved_actions_per_chunk, resolved_smoothing_alpha, notes = resolve_execution_settings(
+            self.policy,
+            actions_per_chunk=actions_per_chunk,
+            smoothing_alpha=smoothing_alpha,
+        )
         with self.lock:
             self.instruction = instruction
             self.endpoint = endpoint
             self.action_fps = action_fps
             self.max_step_deg = max_step_deg
-            self.actions_per_chunk = actions_per_chunk
-            self.smoothing_alpha = float(np.clip(smoothing_alpha, 0.05, 1.0))
+            self.actions_per_chunk = resolved_actions_per_chunk
+            self.smoothing_alpha = resolved_smoothing_alpha
             self.interpolation_steps = max(1, interpolation_steps)
             self.apply_joint_conversion = apply_joint_conversion
             self.smoothed_action_target = None
             self.stop_event.clear()
-        thread = threading.Thread(target=self._eval_loop, name="molmoact_eval_loop", daemon=True)
+        for note in notes:
+            self.log(note)
+        thread = threading.Thread(target=self._eval_loop, name="so101_eval_loop", daemon=True)
         self.eval_thread = thread
         thread.start()
-        self.log("Started closed-loop evaluation.")
+        if is_open_loop_policy(self.policy):
+            self.log(
+                "Started open-loop MolmoAct2 evaluation "
+                "(full chunk, no EMA mixing, no real-time chunking)."
+            )
+        else:
+            self.log("Started evaluation (observe → infer → execute chunk → observe).")
 
     def _eval_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -886,6 +1061,8 @@ class AppState:
 
 
 class MolmoActHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
     def __init__(self, server_address: tuple[str, int], handler: type[BaseHTTPRequestHandler], state: AppState):
         super().__init__(server_address, handler)
         self.state = state
@@ -893,6 +1070,7 @@ class MolmoActHTTPServer(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     server: MolmoActHTTPServer
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         logging.debug("%s - %s", self.client_address[0], fmt % args)
@@ -917,6 +1095,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif path == "/api/frame.jpg":
                 self.send_frame(slot="side" if "slot=side" in parsed_url.query else "top")
+            elif path == "/api/stream.mjpg":
+                self.send_camera_stream(parsed_url.query)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as exc:  # noqa: BLE001
@@ -991,15 +1171,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def update_runtime_settings(self, body: dict[str, Any]) -> None:
         state = self.server.state
+        actions_per_chunk, smoothing_alpha, notes = resolve_execution_settings(
+            state.policy,
+            actions_per_chunk=parse_optional_positive_int(body.get("actions_per_chunk")),
+            smoothing_alpha=float(body.get("smoothing_alpha", state.smoothing_alpha)),
+        )
         with state.lock:
             state.endpoint = str(body.get("endpoint") or state.endpoint)
             state.instruction = str(body.get("instruction") or state.instruction)
             state.action_fps = float(body.get("action_fps", state.action_fps))
             state.max_step_deg = float(body.get("max_step_deg", body.get("max_relative_target", state.max_step_deg)))
-            state.actions_per_chunk = parse_optional_positive_int(body.get("actions_per_chunk"))
-            state.smoothing_alpha = float(np.clip(float(body.get("smoothing_alpha", state.smoothing_alpha)), 0.05, 1.0))
+            state.actions_per_chunk = actions_per_chunk
+            state.smoothing_alpha = smoothing_alpha
             state.interpolation_steps = max(1, int(body.get("interpolation_steps", state.interpolation_steps)))
             state.apply_joint_conversion = bool(body.get("apply_joint_conversion", state.apply_joint_conversion))
+        for note in notes:
+            state.log(note)
 
     def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json_dumps(payload)
@@ -1024,25 +1211,88 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def send_frame(self, *, slot: str) -> None:
-        frame = self.server.state.get_frame(slot=slot)
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        ok, encoded = cv2.imencode(".jpg", bgr)
-        if not ok:
-            raise RuntimeError("Failed to encode camera frame.")
-        data = encoded.tobytes()
+        _, data = self.server.state.get_preview_jpeg(
+            slot=slot,
+            after_timestamp=None,
+            timeout_s=0.0,
+            quality=DEFAULT_PREVIEW_JPEG_QUALITY,
+            max_width=DEFAULT_PREVIEW_MAX_WIDTH,
+        )
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "image/jpeg")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def send_camera_stream(self, query: str) -> None:
+        params = parse_qs(query)
+        slot = "side" if params.get("slot", ["top"])[0] == "side" else "top"
+        fps = int(np.clip(int(params.get("fps", [DEFAULT_PREVIEW_FPS])[0]), MIN_PREVIEW_FPS, MAX_PREVIEW_FPS))
+        quality = int(
+            np.clip(
+                int(params.get("quality", [DEFAULT_PREVIEW_JPEG_QUALITY])[0]),
+                MIN_PREVIEW_JPEG_QUALITY,
+                MAX_PREVIEW_JPEG_QUALITY,
+            )
+        )
+        max_width = max(160, int(params.get("max_width", [DEFAULT_PREVIEW_MAX_WIDTH])[0]))
+        boundary = b"lerobot-frame"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary.decode()}")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0, no-transform")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        frame_period_s = 1.0 / fps
+        timestamp: float | None = None
+        next_frame_at = time.perf_counter()
+        try:
+            while True:
+                wait_s = next_frame_at - time.perf_counter()
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                new_timestamp, data = self.server.state.get_preview_jpeg(
+                    slot=slot,
+                    after_timestamp=timestamp,
+                    timeout_s=max(1.0, frame_period_s * 2),
+                    quality=quality,
+                    max_width=max_width,
+                )
+                if new_timestamp == timestamp:
+                    continue
+                timestamp = new_timestamp
+                self.wfile.write(b"--" + boundary + b"\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(data)}\r\n\r\n".encode("ascii"))
+                self.wfile.write(data)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                next_frame_at = max(next_frame_at + frame_period_s, time.perf_counter())
+        except (OSError, RuntimeError):
+            pass
+        finally:
+            self.close_connection = True
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=DEFAULT_HOST, help="Host interface for the local web UI.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port for the local web UI.")
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="MolmoAct2 /act endpoint URL.")
+    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Policy /act endpoint URL.")
+    parser.add_argument(
+        "--policy",
+        choices=["molmoact2", "pi"],
+        default="molmoact2",
+        help="Policy backend (molmoact2 or open-source pi05/pi0; Pi 0.7 is not public yet).",
+    )
+    parser.add_argument(
+        "--default-apply-joint-conversion",
+        choices=["true", "false"],
+        default=None,
+        help="Default for the SO-101 v3→v2.1 joint conversion checkbox (MolmoAct2 only).",
+    )
     parser.add_argument(
         "--inference-mode",
         choices=["remote", "local"],
@@ -1063,16 +1313,35 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s:%(name)s:%(message)s")
+    if args.default_apply_joint_conversion is None:
+        apply_joint_conversion = args.policy == "molmoact2"
+    else:
+        apply_joint_conversion = args.default_apply_joint_conversion == "true"
     state = AppState(
         endpoint=args.endpoint,
         robot_id=args.robot_id,
+        policy=args.policy,
         inference_mode=args.inference_mode,
         inference_schema=args.inference_schema,
+        apply_joint_conversion=apply_joint_conversion,
     )
     server = MolmoActHTTPServer((args.host, args.port), Handler, state)
     if args.inference_mode == "local":
-        state.log(f"Local MolmoAct2 inference via {args.endpoint} ({args.inference_schema} camera schema).")
-    state.log(f"Open http://{args.host}:{args.port} to evaluate MolmoAct2 on SO-ARM101.")
+        if args.policy == "pi":
+            state.log(
+                f"Local Pi inference via {args.endpoint} ({args.inference_schema} camera schema; "
+                "no MolmoAct joint conversion)."
+            )
+        else:
+            state.log(f"Local MolmoAct2 inference via {args.endpoint} ({args.inference_schema} camera schema).")
+    policy_label = "Pi (pi05/pi0)" if args.policy == "pi" else "MolmoAct2"
+    state.log(f"Open http://{args.host}:{args.port} to evaluate {policy_label} on SO-ARM101.")
+    if args.policy == "pi":
+        state.log("Pi 0.7 weights are not public yet; use open-source pi05/pi0 checkpoints.")
+    else:
+        state.log(
+            "MolmoAct2 inference is fully open-loop: full action chunks, no EMA mixing, no RTC."
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

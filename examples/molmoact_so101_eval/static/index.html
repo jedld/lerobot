@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>MolmoAct2 SO-ARM101 Evaluation</title>
+    <title>SO-ARM101 Policy Evaluation</title>
     <style>
       :root {
         color-scheme: dark;
@@ -174,14 +174,19 @@
   <body>
     <main>
       <section>
-        <h1>MolmoAct2 SO-ARM101 Evaluation</h1>
+        <h1>SO-ARM101 Policy Evaluation</h1>
+        <p class="note" id="policy_note">
+          Supports MolmoAct2 and open-source LeRobot Pi (pi05/pi0). Pi 0.7 weights are not public yet.
+        </p>
         <p class="note" id="camera_note">
           This UI can send two local webcams as <code>top_cam</code> and <code>side_cam</code>
-          to the deployed SO100/SO101 MolmoAct2 endpoint. If only Top is connected, it is
-          duplicated into both inputs.
+          to the deployed policy endpoint. If only Top is connected, it is duplicated into both inputs.
         </p>
 
         <h2>Inference</h2>
+        <div class="pill" style="margin-bottom: 10px">
+          <strong>Policy</strong><span id="policy_status">unknown</span>
+        </div>
         <div class="pill" style="margin-bottom: 10px">
           <strong>Backend</strong><span id="backend_status">unknown</span>
         </div>
@@ -216,17 +221,21 @@
         <div class="row">
           <label>
             Smoothing Alpha
-            <input id="smoothing_alpha" type="number" min="0.05" max="1" step="0.05" value="0.8" />
+            <input id="smoothing_alpha" type="number" min="0.05" max="1" step="0.05" value="1.0" />
           </label>
           <label>
             Interpolation Steps
             <input id="interpolation_steps" type="number" min="1" max="12" step="1" value="3" />
           </label>
         </div>
+        <p class="note" id="open_loop_note">
+          MolmoAct2 runs fully open-loop: the full returned action chunk is executed with no EMA
+          mixing and no real-time chunking.
+        </p>
         <label>
           <span>
             <input id="apply_joint_conversion" type="checkbox" checked />
-            Apply SO-101 v3 to v2.1 joint conversion for MolmoAct2
+            Apply SO-101 v3 to v2.1 joint conversion (MolmoAct2 only; leave off for Pi)
           </span>
         </label>
 
@@ -265,6 +274,21 @@
             <input id="camera_height" type="number" min="64" step="16" value="480" />
           </label>
         </div>
+        <div class="row">
+          <label>
+            Preview FPS
+            <input id="preview_fps" type="number" min="1" max="30" step="1" value="12" />
+          </label>
+          <label>
+            Preview JPEG Quality
+            <input id="preview_quality" type="number" min="30" max="90" step="5" value="65" />
+          </label>
+        </div>
+        <label>
+          Preview Max Width
+          <input id="preview_max_width" type="number" min="160" max="1920" step="80" value="640" />
+        </label>
+        <p class="note">Preview streams use low-latency MJPEG. For slow internet, try 8 FPS, quality 55, and width 480.</p>
 
         <h2>Robot</h2>
         <label>
@@ -294,7 +318,7 @@
           <button onclick="dryRun()">Dry Run</button>
           <button class="primary" onclick="startEval()">Start Evaluation</button>
           <button class="danger" onclick="stopEval()">Stop</button>
-          <button class="warning" onclick="resetHome()">Reset Home</button>
+          <button class="warning" onclick="resetHome()">Reset Start</button>
           <button class="warning" onclick="resetPacked()">Pack Robot</button>
           <button onclick="disconnectAll()">Disconnect</button>
         </div>
@@ -372,6 +396,9 @@
           width: Number($("camera_width").value),
           height: Number($("camera_height").value),
           fps: Number($("camera_fps").value),
+          preview_fps: Number($("preview_fps").value),
+          preview_quality: Number($("preview_quality").value),
+          preview_max_width: Number($("preview_max_width").value),
           serial_port: $("serial_port").value,
           port: $("serial_port").value,
           robot_id: $("robot_id").value,
@@ -548,7 +575,7 @@
       }
 
       async function resetHome() {
-        if (!confirm("Stop evaluation and move the robot to the home position?")) return;
+        if (!confirm("Stop evaluation and move the robot to the MolmoAct2 start pose?")) return;
         await api("/api/reset_home", {});
         await refreshStatus();
       }
@@ -579,14 +606,46 @@
 
       async function renderStatus(status) {
         const localBackend = status.inference_mode === "local";
+        const policy = status.policy || "molmoact2";
+        const policyLabel =
+          policy === "pi"
+            ? '<span class="ok">Pi (pi05/pi0)</span> <span class="note">— Pi 0.7 not public</span>'
+            : '<span class="ok">MolmoAct2</span>';
+        $("policy_status").innerHTML = policyLabel;
         $("backend_status").innerHTML = localBackend
           ? '<span class="ok">local managed</span>'
           : '<span class="warn">remote endpoint</span>';
         $("endpoint").value = status.endpoint || $("endpoint").value;
         $("endpoint").readOnly = localBackend;
-        $("camera_note").innerHTML = localBackend
-          ? 'Local mode maps Top → <code>front_cam</code> and Side → <code>wrist_cam</code> for the upstream MolmoAct2 SO-101 server. If only Top is connected, it is duplicated into both inputs.'
-          : 'This UI can send two local webcams as <code>top_cam</code> and <code>side_cam</code> to the deployed SO100/SO101 MolmoAct2 endpoint. If only Top is connected, it is duplicated into both inputs.';
+        if (policy === "pi") {
+          $("camera_note").innerHTML =
+            'Pi mode maps Top → <code>top_cam</code> and Side → <code>side_cam</code>. The Pi server renames them to the checkpoint camera keys (for example <code>base_0_rgb</code> / <code>left_wrist_0_rgb</code>). Duplicate Top if Side is unavailable.';
+          $("actions_per_chunk").disabled = false;
+          $("smoothing_alpha").disabled = false;
+          $("open_loop_note").textContent =
+            "Pi may use Actions Per Chunk and EMA smoothing. Leave Actions Per Chunk empty to execute the full returned chunk.";
+          if (!$("smoothing_alpha").value) {
+            $("smoothing_alpha").value = "0.8";
+          }
+        } else if (localBackend) {
+          $("camera_note").innerHTML =
+            'Local MolmoAct2 maps Top → <code>front_cam</code> and Side → <code>wrist_cam</code>. If only Top is connected, it is duplicated into both inputs.';
+          $("actions_per_chunk").value = "";
+          $("smoothing_alpha").value = "1.0";
+          $("actions_per_chunk").disabled = true;
+          $("smoothing_alpha").disabled = true;
+          $("open_loop_note").textContent =
+            "MolmoAct2 runs fully open-loop: the full returned action chunk is executed with no EMA mixing and no real-time chunking.";
+        } else {
+          $("camera_note").innerHTML =
+            'Remote MolmoAct2 maps Top → <code>top_cam</code> and Side → <code>side_cam</code>. If only Top is connected, it is duplicated into both inputs.';
+          $("actions_per_chunk").value = "";
+          $("smoothing_alpha").value = "1.0";
+          $("actions_per_chunk").disabled = true;
+          $("smoothing_alpha").disabled = true;
+          $("open_loop_note").textContent =
+            "MolmoAct2 runs fully open-loop: the full returned action chunk is executed with no EMA mixing and no real-time chunking.";
+        }
         $("top_camera_status").innerHTML = formatCameraStatus(status.top_camera, status.top_camera_connected ?? status.camera_connected);
         $("side_camera_status").innerHTML = status.side_camera
           ? formatCameraStatus(status.side_camera, status.side_camera_connected)
@@ -602,7 +661,7 @@
                 status.last_image_state_skew_ms.toFixed(0)
               } ms img/joint, ${status.last_camera_skew_ms?.toFixed(0) ?? "?"} ms cam, ${status.last_side_camera_source ?? "?"}`;
         $("endpoint_status").innerHTML = status.server_metadata
-          ? `<span class="ok">${status.server_metadata.repo_id || "ok"}</span>`
+          ? `<span class="ok">${status.server_metadata.repo_id || status.server_metadata.backend || "ok"}</span>`
           : "unchecked";
         $("inference_status").textContent = status.last_inference_ms
           ? `${status.last_inference_ms.toFixed(0)} ms local, ${status.last_server_dt_ms ?? "?"} ms server`
@@ -618,11 +677,40 @@
           $("log").textContent += `\nERROR: ${status.last_error}`;
         }
         if (status.top_camera_connected ?? status.camera_connected) {
-          $("top_preview").src = `/api/frame.jpg?slot=top&t=${Date.now()}`;
+          ensurePreviewStream("top");
+        } else {
+          stopPreviewStream("top");
         }
         if (status.side_camera_connected) {
-          $("side_preview").src = `/api/frame.jpg?slot=side&t=${Date.now()}`;
+          ensurePreviewStream("side");
+        } else {
+          stopPreviewStream("side");
         }
+      }
+
+      function previewStreamUrl(slot) {
+        const params = new URLSearchParams({
+          slot,
+          fps: String(Math.max(1, Math.min(30, Number($("preview_fps").value) || 12))),
+          quality: String(Math.max(30, Math.min(90, Number($("preview_quality").value) || 65))),
+          max_width: String(Math.max(160, Number($("preview_max_width").value) || 640)),
+        });
+        return `/api/stream.mjpg?${params}`;
+      }
+
+      function ensurePreviewStream(slot) {
+        const preview = $(`${slot}_preview`);
+        const streamUrl = previewStreamUrl(slot);
+        if (preview.dataset.streamUrl === streamUrl && preview.getAttribute("src")) return;
+        preview.dataset.streamUrl = streamUrl;
+        preview.src = `${streamUrl}&generation=${Date.now()}`;
+      }
+
+      function stopPreviewStream(slot) {
+        const preview = $(`${slot}_preview`);
+        if (!preview.getAttribute("src")) return;
+        preview.removeAttribute("src");
+        delete preview.dataset.streamUrl;
       }
 
       function renderJointPositions(positions) {
